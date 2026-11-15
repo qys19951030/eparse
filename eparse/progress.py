@@ -50,9 +50,7 @@ class ProgressLog:
 
         p = Path(path)
         if p.exists() and not p.is_file():
-            raise ValueError(
-                f"progress path exists but is not a file: {path}"
-            )
+            raise ValueError(f"progress path exists but is not a file: {path}")
 
     def open(self) -> int:
         """

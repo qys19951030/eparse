@@ -320,9 +320,8 @@ class BaseDatabaseInterface(BaseInterface):
             # replace every cell of this table
             self.Model.delete().where(self.Model.table_id == table_id).execute()
             for start in range(0, n_cells, INSERT_CHUNK):
-                self.Model.insert_many(
-                    serialized[start : start + INSERT_CHUNK]
-                ).execute()
+                end = start + INSERT_CHUNK
+                self.Model.insert_many(serialized[start:end]).execute()
 
             if existing is None:
                 ExcelTable.create(

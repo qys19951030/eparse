@@ -77,7 +77,10 @@ def discover_excel_files(targets: Sequence, recursive: bool = False) -> List[Pat
             for candidate in path.glob(pattern):
                 if candidate.is_file() and candidate.suffix.lower() in EXCEL_SUFFIXES:
                     files.append(candidate)
-        elif path.is_file():
+        elif path.is_file() and path.suffix.lower() in EXCEL_SUFFIXES:
+            # explicit targets are filtered too, so database and progress
+            # files living next to the spreadsheets are never treated as
+            # inputs
             files.append(path)
 
     # sorted by filename for deterministic scheduling
@@ -102,8 +105,8 @@ class Importer:
         exclude_nested: bool = False,
         na_tolerance_r: int = 2,
         na_tolerance_c: int = 2,
-        stdout: TextIO = sys.stdout,
-        stderr: TextIO = sys.stderr,
+        stdout: Optional[TextIO] = None,
+        stderr: Optional[TextIO] = None,
     ):
         self.interface = interface
         self.files = list(files)
@@ -116,9 +119,19 @@ class Importer:
         self.exclude_nested = exclude_nested
         self.na_tolerance_r = na_tolerance_r
         self.na_tolerance_c = na_tolerance_c
+        # resolve lazily at call time so test runners that replace
+        # sys.stdout/sys.stderr are not bypassed by import-time binding
         self.stdout = stdout
         self.stderr = stderr
         self.summary = ImportSummary()
+
+    @property
+    def out(self) -> TextIO:
+        return self.stdout if self.stdout is not None else sys.stdout
+
+    @property
+    def err(self) -> TextIO:
+        return self.stderr if self.stderr is not None else sys.stderr
 
     # ------------------------------------------------------------------ #
     # pre-flight
@@ -159,7 +172,7 @@ class Importer:
             lock.acquire()
         except LockAcquireError as exc:
             # fail fast / timeout: no work is done, state is untouched
-            print(f"writer lock error - {exc}", file=self.stderr)
+            print(f"writer lock error - {exc}", file=self.err)
             raise
 
         try:
@@ -169,7 +182,7 @@ class Importer:
                 print(
                     f"discarded {self.summary.progress_lines_discarded} "
                     "truncated progress line(s)",
-                    file=self.stderr,
+                    file=self.err,
                 )
 
             try:
@@ -180,7 +193,7 @@ class Importer:
         finally:
             lock.release()
 
-        print(self.summary.render(), file=self.stderr)
+        print(self.summary.render(), file=self.err)
         return self.summary
 
     # ------------------------------------------------------------------ #
@@ -194,7 +207,7 @@ class Importer:
         # is skipped and counted separately from successes
         if progress.is_succeeded(path_str, digest):
             self.summary.files_skipped += 1
-            print(f"skipped (already imported): {path_str}", file=self.stderr)
+            print(f"skipped (already imported): {path_str}", file=self.err)
             return
 
         file_failed = False
@@ -220,7 +233,7 @@ class Importer:
                     failure_reason = f"table at {anchor}: {exc}"
                     print(
                         f"error in {path_str} {failure_reason}",
-                        file=self.stderr,
+                        file=self.err,
                     )
                     break
                 if result["action"] == "inserted":
@@ -232,7 +245,7 @@ class Importer:
             # file-level parse failure is isolated: later files still run
             file_failed = True
             failure_reason = str(exc)
-            print(f"error reading {path_str}: {exc}", file=self.stderr)
+            print(f"error reading {path_str}: {exc}", file=self.err)
 
         if file_failed:
             self.summary.files_failed += 1
@@ -292,6 +305,6 @@ class Importer:
                 },
                 ensure_ascii=False,
             ),
-            file=self.stdout,
+            file=self.out,
         )
         return result

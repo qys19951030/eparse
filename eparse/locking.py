@@ -126,9 +126,7 @@ class PostgresWriterLock(BaseWriterLock):
         DATABASE.connect(reuse_if_open=True)
         self._key = self._advisory_key()
         deadline = None if self.timeout < 0 else time.monotonic() + self.timeout
-        cursor = DATABASE.execute_sql(
-            "SELECT pg_try_advisory_lock(%s, %s)", self._key
-        )
+        cursor = DATABASE.execute_sql("SELECT pg_try_advisory_lock(%s, %s)", self._key)
         while not cursor.fetchone()[0]:
             if deadline is not None and time.monotonic() >= deadline:
                 raise LockAcquireError(

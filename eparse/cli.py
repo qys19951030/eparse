@@ -18,6 +18,7 @@ from .core import (
     df_serialize_table,
     get_df_from_file,
 )
+from .importer import Importer, discover_excel_files
 from .interfaces import ExcelParse, i_factory
 
 
@@ -33,7 +34,8 @@ def handle(e, exceptions=None, msg=None, debug=False, exit=True):
         exceptions = [exceptions]
 
     if exceptions is None or type(e) in exceptions:
-        print(msg)
+        # diagnostics always go to stderr; stdout is reserved for results
+        print(msg, file=sys.stderr)
 
         if debug:
             raise e
@@ -336,6 +338,91 @@ def parse(ctx, sheet, serialize, table, nacount, exclude_nested):
                 msg = f"skipping {f} - {e}"
                 handle(e, msg=msg, debug=ctx.obj["debug"], exit=False)
                 continue
+
+
+@main.command(name="import")
+@click.pass_context
+@click.option(
+    "--progress",
+    "-p",
+    type=click.Path(),
+    required=True,
+    help="append-only jsonl progress log for resume and bookkeeping",
+)
+@click.option(
+    "--lock-timeout",
+    type=float,
+    default=30.0,
+    show_default=True,
+    help="seconds to wait for the writer lock; 0 fails fast",
+)
+@click.option(
+    "--sheet",
+    "-s",
+    type=str,
+    multiple=True,
+    help="name of sheet(s) to parse",
+)
+@click.option(
+    "--table",
+    "-t",
+    type=str,
+    default=None,
+    help="name of table to parse",
+)
+@click.option(
+    "--nacount",
+    type=int,
+    default=1,
+    show_default=True,
+    help="allow for this many NA values when spanning rows and columns",
+)
+@click.option(
+    "--exclude-nested",
+    is_flag=True,
+    default=False,
+    help="exclude nested tables from output (only top-level tables)",
+)
+def import_cmd(ctx, progress, lock_timeout, sheet, table, nacount, exclude_nested):
+    """
+    idempotently import excel tables into the target database
+    """
+
+    output = ctx.obj["output"]
+    if not (output.startswith("sqlite3") or output.startswith("postgres")):
+        msg = f"import requires a database output, got: {output}"
+        handle(ValueError(msg), msg=msg, debug=ctx.obj["debug"])
+
+    files = discover_excel_files(ctx.obj["files"], ctx.obj["recursive"])
+
+    importer = Importer(
+        interface=ctx.obj["output_obj"],
+        files=files,
+        progress_path=progress,
+        lock_timeout=lock_timeout,
+        loose=ctx.obj["loose"],
+        recursive=ctx.obj["recursive"],
+        sheet=sheet,
+        table=table,
+        exclude_nested=exclude_nested,
+        na_tolerance_r=nacount + 1,
+        na_tolerance_c=nacount + 1,
+    )
+
+    try:
+        summary = importer.run()
+    except ValueError as e:
+        # pre-flight failures (unwritable db, identity error, bad progress
+        # path) abort before any processing
+        handle(e, msg=f"import pre-flight error - {e}", debug=ctx.obj["debug"])
+    except Exception as e:
+        # writer lock timeout/fail-fast also aborts without partial work
+        handle(e, msg=f"import failed - {e}", debug=ctx.obj["debug"])
+
+    # any failed file makes the overall command non-zero, but skipped and
+    # successful work is already durably committed
+    if summary.files_failed:
+        sys.exit(1)
 
 
 @main.command()
