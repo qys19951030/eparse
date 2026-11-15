@@ -26,7 +26,7 @@ def test_sqlite3_db(sqlite3_db):
 
 
 def test_ExcelParse_model(sqlite3_db):
-    assert ExcelParse.get_queryset().shape == (1, 12)
+    assert ExcelParse.get_queryset().shape == (1, 13)
     assert ExcelParse.get_column("c_header").shape == (1, 4)
 
 

@@ -25,10 +25,14 @@ from peewee import (
     SqliteDatabase,
     fn,
 )
+from playhouse.migrate import SchemaMigrator, migrate
 
 from .core import html_to_serialized_data
 
 DATABASE = DatabaseProxy()
+
+# insert chunk size keeps individual statements bounded for large tables
+INSERT_CHUNK = 1000
 
 
 class ExcelParse(Model):
@@ -47,6 +51,9 @@ class ExcelParse(Model):
     name = CharField(index=True)
     sheet = CharField(index=True)
     f_name = CharField(index=True)
+    # stable identity of the table this cell belongs to (nullable for rows
+    # written through the legacy plain output() path)
+    table_id = CharField(index=True, null=True)
     timestamp = DateTimeField(default=datetime.utcnow)
 
     @classmethod
@@ -79,6 +86,32 @@ class ExcelParse(Model):
     class Meta:
         database = DATABASE
         indexes = ((("f_name", "sheet", "name"), False),)
+
+
+class ExcelTable(Model):
+    """
+    registry of imported tables keyed by their stable table id
+
+    one row per known table identity; a header change yields a new id and
+    therefore a new row, while re-importing unchanged content updates the
+    same row in place.
+    """
+
+    table_id = CharField(primary_key=True)
+    f_name = CharField(index=True)
+    file_digest = CharField()
+    sheet = CharField(index=True)
+    anchor = CharField()
+    headers = CharField()
+    n_rows = IntegerField()
+    n_cols = IntegerField()
+    n_cells = IntegerField()
+    created_at = DateTimeField(default=datetime.utcnow)
+    updated_at = DateTimeField(default=datetime.utcnow)
+
+    class Meta:
+        database = DATABASE
+        table_name = "exceltable"
 
 
 class BaseInterface:
@@ -178,6 +211,41 @@ class BaseDatabaseInterface(BaseInterface):
 
         pass
 
+    def ensure_schema(self):
+        """
+        create tables and upgrade older databases in place
+
+        safe to run repeatedly; new columns added to an existing table are
+        detected through the database catalog rather than by version alone.
+        """
+
+        self.initialize(DATABASE)
+        DATABASE.connect(reuse_if_open=True)
+        DATABASE.create_tables([self.Model, ExcelTable])
+
+        if not any(
+            c.name == "table_id"
+            for c in DATABASE.get_columns(self.Model._meta.table_name)
+        ):
+            migrator = SchemaMigrator.from_database(DATABASE.obj)
+            # add the bare column first; the field's index would otherwise
+            # collide with the index create_tables() already attempts
+            migrate(migrator.add_column("excelparse", "table_id", CharField(null=True)))
+            DATABASE.execute_sql(
+                "CREATE INDEX IF NOT EXISTS excelparse_table_id "
+                "ON excelparse (table_id)"
+            )
+
+    def assert_writable(self):
+        """
+        pre-flight probe: fail before processing anything when the target
+        database cannot be created or written to
+        """
+
+        self.ensure_schema()
+        with DATABASE.atomic():
+            DATABASE.execute_sql("SELECT 1")
+
     def input(self, method, **kwargs):
         m = getattr(self.Model, method, None)
 
@@ -187,8 +255,7 @@ class BaseDatabaseInterface(BaseInterface):
             patt = r"^(?:get_)?(?P<column>.*)$"
             kwargs["column"] = re.match(patt, method).group("column")
 
-        self.initialize(DATABASE)
-        DATABASE.connect()
+        self.ensure_schema()
 
         return m(**kwargs)
 
@@ -206,15 +273,85 @@ class BaseDatabaseInterface(BaseInterface):
         except Exception:
             raise ValueError("bad data - did you serialize it first?")
 
-        self.initialize(DATABASE)
-        DATABASE.connect()
-        DATABASE.create_tables([self.Model])
+        self.ensure_schema()
 
         # insert data into Model
         with DATABASE.atomic():
             self.Model.insert_many(data).execute()
 
         # DATABASE.close()
+
+    def upsert_table(
+        self,
+        table_id: str,
+        serialized: list,
+        meta: Dict,
+    ) -> Dict:
+        """
+        idempotent whole-table replacement inside a single transaction
+
+        an existing table with the same id is deleted and repopulated; a new
+        id is inserted.  either every change commits or none does, leaving
+        the previous content untouched on failure.
+
+        meta carries: f_name, file_digest, sheet, anchor, headers,
+        n_rows, n_cols.
+
+        returns {"action": "inserted" | "updated", "rows": <cell count>}
+        """
+
+        if not serialized:
+            raise ValueError("cannot upsert an empty table")
+
+        self.ensure_schema()
+
+        for record in serialized:
+            record["table_id"] = table_id
+
+        n_rows = int(meta["n_rows"])
+        n_cols = int(meta["n_cols"])
+        n_cells = len(serialized)
+        now = datetime.utcnow()
+
+        with DATABASE.atomic():
+            existing = ExcelTable.get_or_none(ExcelTable.table_id == table_id)
+            action = "updated" if existing is not None else "inserted"
+
+            # replace every cell of this table
+            self.Model.delete().where(self.Model.table_id == table_id).execute()
+            for start in range(0, n_cells, INSERT_CHUNK):
+                self.Model.insert_many(
+                    serialized[start : start + INSERT_CHUNK]
+                ).execute()
+
+            if existing is None:
+                ExcelTable.create(
+                    table_id=table_id,
+                    f_name=meta["f_name"],
+                    file_digest=meta["file_digest"],
+                    sheet=meta["sheet"],
+                    anchor=meta["anchor"],
+                    headers=meta["headers"],
+                    n_rows=n_rows,
+                    n_cols=n_cols,
+                    n_cells=n_cells,
+                    created_at=now,
+                    updated_at=now,
+                )
+            else:
+                ExcelTable.update(
+                    f_name=meta["f_name"],
+                    file_digest=meta["file_digest"],
+                    sheet=meta["sheet"],
+                    anchor=meta["anchor"],
+                    headers=meta["headers"],
+                    n_rows=n_rows,
+                    n_cols=n_cols,
+                    n_cells=n_cells,
+                    updated_at=now,
+                ).where(ExcelTable.table_id == table_id).execute()
+
+        return {"action": action, "rows": n_cells}
 
     def migrate(self, migration):
         try:
@@ -241,7 +378,19 @@ class Sqlite3Interface(BaseDatabaseInterface):
             self.name = f".files/{uuid4()}.db"
 
     def initialize(self, db):
-        db.initialize(SqliteDatabase(self.name))
+        db.initialize(
+            SqliteDatabase(
+                self.name,
+                pragmas={
+                    # readers see a committed snapshot and never block the
+                    # single writer
+                    "journal_mode": "wal",
+                    # wait rather than error immediately on a busy database
+                    "busy_timeout": 30000,
+                    "foreign_keys": 1,
+                },
+            )
+        )
 
 
 class PostgresInterface(BaseDatabaseInterface):
